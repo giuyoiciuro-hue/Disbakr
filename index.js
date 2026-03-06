@@ -39,6 +39,7 @@ const STABLE_SYMBOLS = [
 const binance = new ccxt.binance({ enableRateLimit: true });
 
 async function getOHLCV(symbol, interval) {
+    // Map internal intervals to CCXT intervals
     const timeframeMap = {
         '1h': '1h',
         '4h': '4h',
@@ -46,20 +47,14 @@ async function getOHLCV(symbol, interval) {
         '1w': '1w'
     };
     const tf = timeframeMap[interval] || '1d';
-
-    // 🔹 دعم BTCUSDT وتحويله تلقائياً إلى BTC/USDT
-    let ccxtSymbol = symbol;
-    if (!symbol.includes('/')) {
-        if (symbol.endsWith('USDT')) {
-            ccxtSymbol = symbol.replace('USDT', '/USDT');
-        }
-    }
-
+    
+    // Convert symbol from SYMBOL/USDT to SYMBOL/USDT (CCXT format)
+    // Most symbols in COMMON_SYMBOLS are already in SYMBOL/USDT format
     try {
-        const ohlcv = await binance.fetchOHLCV(ccxtSymbol, tf, undefined, 100);
-        return ohlcv;
+        const ohlcv = await binance.fetchOHLCV(symbol, tf, undefined, 100);
+        return ohlcv; // [[timestamp, open, high, low, close, volume], ...]
     } catch (e) {
-        console.error(`Error fetching OHLCV for ${ccxtSymbol} on Binance:`, e.message);
+        console.error(`Error fetching OHLCV for ${symbol} on Binance:`, e.message);
         return null;
     }
 }
@@ -190,18 +185,23 @@ function formatTicker(ticker) {
 }
 
 app.get('/analyze-rsi', async (req, res) => {
+    console.log('RSI analysis started', { query: req.query });
     const settings = await loadSettings(RSI_SETTINGS_FILE);
     const intervals = (req.query.intervals || settings.intervals.join(',')).split(',');
     const rsiType = req.query.type || settings.type;
     const [lowerBound, upperBound] = rsiType.split('/').map(Number);
+    console.log('RSI analysis settings loaded', { intervals, rsiType, lowerBound, upperBound });
 
     try {
+        console.log('Fetching tickers from Binance...');
         const tickers = await binance.fetchTickers();
         const usdtTickers = Object.values(tickers).filter(t => t.symbol && t.symbol.endsWith('/USDT'));
+        console.log(`Found ${usdtTickers.length} USDT tickers`);
         const symbols = usdtTickers
             .sort((a, b) => (b.quoteVolume || 0) - (a.quoteVolume || 0))
             .slice(0, 50) 
             .map(formatTicker);
+        console.log(`Selected ${symbols.length} symbols for analysis`);
 
         const resultsMap = new Map();
 
@@ -210,7 +210,14 @@ app.get('/analyze-rsi', async (req, res) => {
             const ccxtSymbol = `${symbol}USDT`;
             try {
                 const ohlcv = await getOHLCV(ccxtSymbol, interval);
-                if (!ohlcv || !Array.isArray(ohlcv) || ohlcv.length < 30) return null;
+                if (!ohlcv || !Array.isArray(ohlcv)) {
+                    console.log(`No OHLCV data for ${ccxtSymbol} on ${interval}`);
+                    return null;
+                }
+                if (ohlcv.length < 30) {
+                    console.log(`Not enough data for ${ccxtSymbol} on ${interval} (length: ${ohlcv.length})`);
+                    return null;
+                }
 
                 const lows = ohlcv.map(d => d[3]);
                 const closes = ohlcv.map(d => d[4]);
@@ -321,23 +328,32 @@ app.get('/analyze-rsi', async (req, res) => {
                 if (b.matches.length !== a.matches.length) return b.matches.length - a.matches.length;
                 return b.strength - a.strength;
             });
+        console.log(`RSI analysis complete. Found ${finalResults.length} results.`);
         await saveResults(finalResults, RSI_DATA_FILE);
         res.json(finalResults);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { 
+        console.error('RSI analysis error:', e);
+        res.status(500).json({ error: e.message }); 
+    }
 });
 
 app.get('/analyze', async (req, res) => {
+    console.log('MACD analysis started', { query: req.query });
     const settings = await loadSettings();
     const intervals = (req.query.intervals || settings.intervals.join(',')).split(',');
     const analysisType = req.query.type || settings.type;
+    console.log('MACD analysis settings loaded', { intervals, analysisType });
 
     try {
+        console.log('Fetching tickers from Binance...');
         const tickers = await binance.fetchTickers();
         const usdtTickers = Object.values(tickers).filter(t => t.symbol && t.symbol.endsWith('/USDT'));
+        console.log(`Found ${usdtTickers.length} USDT tickers`);
         const symbols = usdtTickers
             .sort((a, b) => (b.quoteVolume || 0) - (a.quoteVolume || 0))
             .slice(0, 50) 
             .map(formatTicker);
+        console.log(`Selected ${symbols.length} symbols for analysis`);
 
         const resultsMap = new Map();
 
@@ -346,7 +362,14 @@ app.get('/analyze', async (req, res) => {
             const ccxtSymbol = `${symbol}USDT`;
             try {
                 const ohlcv = await getOHLCV(ccxtSymbol, interval);
-                if (!ohlcv || !Array.isArray(ohlcv) || ohlcv.length < 30) return null;
+                if (!ohlcv || !Array.isArray(ohlcv)) {
+                    console.log(`No OHLCV data for ${ccxtSymbol} on ${interval}`);
+                    return null;
+                }
+                if (ohlcv.length < 30) {
+                    console.log(`Not enough data for ${ccxtSymbol} on ${interval} (length: ${ohlcv.length})`);
+                    return null;
+                }
 
                 const lows = ohlcv.map(d => d[3]);
                 const closes = ohlcv.map(d => d[4]);
@@ -541,9 +564,11 @@ app.get('/analyze', async (req, res) => {
                 }
                 return b.strength - a.strength;
             });
-        await saveResults(finalResults);
+        console.log(`MACD analysis complete. Found ${finalResults.length} results.`);
+        await saveResults(finalResults, DATA_FILE);
         res.json(finalResults);
     } catch (e) { 
+        console.error('MACD analysis error:', e);
         res.status(500).json({ error: e.message }); 
     }
 });
@@ -572,27 +597,37 @@ app.get('/api/arbitrage-last-results', async (req, res) => {
 });
 
 app.get('/api/arbitrage', async (req, res) => {
+    console.log('Arbitrage analysis started');
     try {
         const fetchTasks = ARB_EXCHANGES.map(id => (async () => {
             const ex = getArbExchange(id);
-            if (!ex) return [];
+            if (!ex) {
+                console.log(`Exchange ${id} not initialized`);
+                return [];
+            }
             try {
                 const tickers = await ex.fetchTickers();
-                        return Object.values(tickers)
-                            .filter(t => t.symbol && t.symbol.endsWith('/USDT') && t.bid > 0 && t.ask > 0)
-                            .map(t => ({ 
-                                exchange: id.toUpperCase(), 
-                                symbol: t.symbol, 
-                                bid: t.bid, // Price to SELL immediately (Best Bid)
-                                ask: t.ask,  // Price to BUY immediately (Best Ask)
-                                bidVolume: t.bidVolume, // Available volume to sell
-                                askVolume: t.askVolume  // Available volume to buy
-                            }));
-                    } catch (e) { return []; }
-                })());
+                const filtered = Object.values(tickers)
+                    .filter(t => t.symbol && t.symbol.endsWith('/USDT') && t.bid > 0 && t.ask > 0)
+                    .map(t => ({ 
+                        exchange: id.toUpperCase(), 
+                        symbol: t.symbol, 
+                        bid: t.bid, 
+                        ask: t.ask, 
+                        bidVolume: t.bidVolume, 
+                        askVolume: t.askVolume  
+                    }));
+                console.log(`Fetched ${filtered.length} tickers from ${id}`);
+                return filtered;
+            } catch (e) { 
+                console.log(`Error fetching tickers from ${id}:`, e.message);
+                return []; 
+            }
+        })());
 
-                const allResults = await Promise.all(fetchTasks);
-                const allTickers = allResults.flat();
+        const allResults = await Promise.all(fetchTasks);
+        const allTickers = allResults.flat();
+        console.log(`Total tickers collected: ${allTickers.length}`);
                 const groups = {};
                 allTickers.forEach(t => {
                     if (!groups[t.symbol]) groups[t.symbol] = [];
@@ -636,9 +671,13 @@ app.get('/api/arbitrage', async (req, res) => {
             timestamp: new Date().toISOString(),
             opportunities: opportunities.sort((a, b) => b.maxDiff - a.maxDiff) 
         };
+        console.log(`Arbitrage analysis complete. Found ${opportunities.length} opportunities.`);
         await saveResults(finalArbResults, ARB_DATA_FILE);
         res.json(finalArbResults);
-    } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { 
+        console.error('Arbitrage analysis error:', e);
+        res.status(500).json({ error: e.message }); 
+    }
 });
 
 app.listen(port, '0.0.0.0', () => {
