@@ -58,7 +58,23 @@ async function fetchWithRestrictedFallbacks(exchangeInstance, methodName, ...arg
     } catch (e) {
         if (e.message.includes('restricted location') || e.message.includes('451')) {
             console.log(`Detected restricted location for ${exchangeInstance.id}. Attempting proxy fallbacks...`);
-            // في حالة الحظر الجغرافي، سنحاول استخدام عناوين API بديلة إذا توفرت في CCXT
+            
+            // محاولة استخدام البروكسيات المجانية من القائمة
+            for (const proxyBase of PROXY_LIST) {
+                try {
+                    console.log(`Attempting free proxy: ${proxyBase}`);
+                    // CCXT supports 'proxy' property which prefixes the URL
+                    exchangeInstance.proxy = proxyBase;
+                    const result = await exchangeInstance[methodName](...args);
+                    console.log(`Success with proxy: ${proxyBase}`);
+                    return result;
+                } catch (proxyErr) {
+                    console.error(`Proxy ${proxyBase} failed: ${proxyErr.message}`);
+                    continue;
+                }
+            }
+
+            // محاولة العناوين البديلة كحل ثانٍ خاص بـ Binance
             if (exchangeInstance.id === 'binance') {
                 const alternativeUrls = [
                     'https://api1.binance.com',
