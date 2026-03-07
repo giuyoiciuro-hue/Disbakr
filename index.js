@@ -1,779 +1,533 @@
-const express = require('express');
-const axios = require('axios');
-const { MACD, RSI } = require('technicalindicators');
-const fs = require('fs-extra');
-const path = require('path');
-const pLimit = (limit) => {
-    let active = 0;
-    const queue = [];
-    const next = () => {
-        active--;
-        if (queue.length > 0) {
-            queue.shift()();
-        }
-    };
-    return (fn) => new Promise((resolve, reject) => {
-        const run = async () => {
-            active++;
-            try {
-                resolve(await fn());
-            } catch (err) {
-                reject(err);
-            } finally {
-                next();
-            }
-        };
-        if (active < limit) {
-            run();
-        } else {
-            queue.push(run);
-        }
-    });
-};
-const ccxt = require('ccxt');
-
-const STABLE_SYMBOLS = [
-    'USDT', 'USDC', 'BUSD', 'DAI', 'FDUSD', 'TUSD', 'USDP', 'USDD', 'GUSD', 'FRAX', 'LUSD', 'EURC', 'USDAI'
-];
-
-const binance = new ccxt.binance({ 
-    enableRateLimit: true,
-    options: {
-        'adjustForTimeDifference': true,
-        'recvWindow': 10000,
-        'warnOnFetchAllowFallback': true,
-    }
-});
-
-// قائمة عناوين البروكسي العامة لتجاوز الحظر الجغرافي
-const PROXY_LIST = [
-    'https://api.allorigins.win/raw?url=',
-    'https://api.codetabs.com/v1/proxy/?quest=',
-    'https://thingproxy.freeboard.io/fetch/',
-    'https://cors-anywhere.herokuapp.com/'
-];
-
-// نطاقات بديلة لـ Binance قد تعمل في مناطق محظورة
-const BINANCE_DOMAINS = [
-    'https://api.binance.com',
-    'https://api1.binance.com',
-    'https://api2.binance.com',
-    'https://api3.binance.com',
-    'https://api4.binance.com',
-    'https://data-api.binance.vision',
-    'https://api.binance.me',
-    'https://api.binance.vision'
-];
-
-async function fetchWithRestrictedFallbacks(exchangeInstance, methodName, ...args) {
-    // 1. المحاولة العادية أولاً
-    try {
-        const result = await exchangeInstance[methodName](...args);
-        return result;
-    } catch (e) {
-        if (!e.message.includes('restricted location') && !e.message.includes('451')) {
-            throw e;
-        }
-        console.log(`[!] Detected restricted location for ${exchangeInstance.id}. Starting Smart Fallback...`);
-    }
-
-    // 2. المحاولة عبر نطاقات Binance البديلة (أحياناً النطاق نفسه محظور وليس الـ IP)
-    if (exchangeInstance.id === 'binance') {
-        for (const domain of BINANCE_DOMAINS) {
-            try {
-                console.log(`[*] Trying Binance alternative domain: ${domain}`);
-                exchangeInstance.urls['api']['public'] = domain;
-                const result = await exchangeInstance[methodName](...args);
-                console.log(`[SUCCESS] Managed to connect using domain: ${domain}`);
-                return result;
-            } catch (err) {
-                continue;
-            }
-        }
-    }
-
-    // 3. المحاولة عبر البروكسيات المجانية (Prefix Proxies)
-    for (const proxyBase of PROXY_LIST) {
-        try {
-            console.log(`[*] Attempting via Free Proxy: ${proxyBase}`);
-            exchangeInstance.proxy = proxyBase;
-            const result = await exchangeInstance[methodName](...args);
-            console.log(`[SUCCESS] Managed to connect using Proxy: ${proxyBase}`);
-            return result;
-        } catch (proxyErr) {
-            continue;
-        }
-    }
-
-    // 4. الحل الأخير الذكي: استخدام منصة أخرى لجلب البيانات (بدون حذف Binance)
-    console.log(`[!] All direct Binance connections failed. Fetching price from alternative exchange for ${args[0] || 'tickers'}...`);
-    try {
-        // نستخدم KuCoin أو MEXC كمصادر بديلة لأنها غالباً ما تملك نفس العملات
-        const altExchange = new ccxt.kucoin({ enableRateLimit: true });
-        console.log(`[*] Switching source to KuCoin for this request...`);
-        
-        if (methodName === 'fetchTickers') {
-            const tickers = await altExchange.fetchTickers();
-            console.log(`[SUCCESS] Data retrieved from KuCoin (as Binance fallback).`);
-            return tickers;
-        }
-        
-        if (methodName === 'fetchOHLCV') {
-            const ohlcv = await altExchange.fetchOHLCV(...args);
-            console.log(`[SUCCESS] OHLCV data retrieved from KuCoin (as Binance fallback).`);
-            return ohlcv;
-        }
-
-        const result = await altExchange[methodName](...args);
-        console.log(`[SUCCESS] Data retrieved from KuCoin.`);
-        return result;
-    } catch (altErr) {
-        console.error(`[!] Alternative exchange also failed: ${altErr.message}`);
-    }
-
-    throw new Error('All free fallback methods failed to bypass restriction.');
-}
-
-async function getOHLCV(symbol, interval) {
-    // Map internal intervals to CCXT intervals
-    const timeframeMap = {
-        '1h': '1h',
-        '4h': '4h',
-        '1d': '1d',
-        '1w': '1w'
-    };
-    const tf = timeframeMap[interval] || '1d';
-    
-    try {
-        const ohlcv = await fetchWithRestrictedFallbacks(binance, 'fetchOHLCV', symbol, tf, undefined, 100);
-        return ohlcv; 
-    } catch (e) {
-        console.error(`Error fetching OHLCV for ${symbol} on Binance:`, e.message);
-        return null;
-    }
-}
-
-async function fetchWithRetry(url, params, retries = 5) {
-    try {
-        const res = await axios.get(url, { params, timeout: 15000 });
-        if (url.includes('coingecko.com')) {
-            // Keep a smaller delay for price updates to be safe
-            await new Promise(r => setTimeout(r, 1000));
-        }
-        return res;
-    } catch (e) {
-        if (e.response && e.response.status === 429 && retries > 0) {
-            console.log(`Rate limited on ${url}, retrying in 5s... (${retries} left)`);
-            await new Promise(r => setTimeout(r, 5000));
-            return fetchWithRetry(url, params, retries - 1);
-        }
-        throw e;
-    }
-}
+import { Connection, PublicKey, Keypair } from "@solana/web3.js";
+import bs58 from "bs58";
+import express from "express";
+import TelegramBot from "node-telegram-bot-api";
+import fs from "fs";
+import path from "path";
+import fetch from "node-fetch";
 
 const app = express();
-const port = 5000;
-const COINGECKO_API_KEY = process.env.COINGECKO_API_KEY;
-const DATA_FILE = path.join(__dirname, 'last_results.json');
-const RSI_DATA_FILE = path.join(__dirname, 'rsi_results.json');
-const ARB_DATA_FILE = path.join(__dirname, 'arbitrage_results.json');
-const SETTINGS_FILE = path.join(__dirname, 'settings.json');
-const RSI_SETTINGS_FILE = path.join(__dirname, 'rsi_settings.json');
-const limit = pLimit(10);
+const PORT = process.env.PORT || 5000;
 
-app.use(express.json());
-app.use(express.static(__dirname));
+// توكن البوت
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-const EXCHANGES = [
-    'binance', 'bybit', 'okx', 'kucoin', 'gateio', 
-    'mexc', 'bitget', 'kraken', 'bitfinex', 'coinbase'
+// 3 RPCs فقط كما طلبت
+const ALCHEMY_URLS = [
+  process.env.RPC_URL,
+  process.env.RPC_URL2,
+  process.env.RPC_URL3
 ];
 
-const COMMON_SYMBOLS = [
-    'BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT', 'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'DOGE/USDT', 'LINK/USDT', 
-    'MATIC/USDT', 'LTC/USDT', 'SHIB/USDT', 'TRX/USDT', 'NEAR/USDT', 'UNI/USDT', 'ICP/USDT', 'ETC/USDT', 'FIL/USDT', 'ATOM/USDT',
-    'APT/USDT', 'OP/USDT', 'ARB/USDT', 'TIA/USDT', 'SUI/USDT', 'SEI/USDT', 'INJ/USDT', 'RNDR/USDT', 'FET/USDT', 'STX/USDT',
-    'KAS/USDT', 'IMX/USDT', 'PEPE/USDT', 'BONK/USDT', 'WIF/USDT', 'ORDI/USDT', 'BEAM/USDT', 'PYTH/USDT', 'JUP/USDT', 'DYM/USDT',
-    'STRK/USDT', 'MANTA/USDT', 'ALT/USDT', 'PIXEL/USDT', 'RON/USDT', 'ZETA/USDT', 'MAVIA/USDT', 'XAI/USDT', 'WLD/USDT', 'ARKM/USDT',
-    'PENDLE/USDT', 'AGIX/USDT', 'OCEAN/USDT', 'GLM/USDT', 'AKT/USDT', 'NOS/USDT', 'RENDER/USDT', 'THETA/USDT', 'HBAR/USDT', 'VET/USDT',
-    'GRT/USDT', 'AAVE/USDT', 'EGLD/USDT', 'SAND/USDT', 'MANA/USDT', 'AXS/USDT', 'GALA/USDT', 'FLOW/USDT', 'CHZ/USDT', 'EOS/USDT',
-    'NEO/USDT', 'IOTA/USDT', 'MKR/USDT', 'SNX/USDT', 'CRV/USDT', 'LDO/USDT', 'RPL/USDT', 'FXS/USDT', 'COMP/USDT', 'ZEC/USDT',
-    'DASH/USDT', 'XMR/USDT', 'KAVA/USDT', 'ZIL/USDT', 'HOT/USDT', 'RVN/USDT', 'BAT/USDT', 'ENJ/USDT', 'ANKR/USDT', 'ROSE/USDT',
-    'CELO/USDT', 'MINA/USDT', 'QTUM/USDT', 'OMG/USDT', 'ICX/USDT', 'ONT/USDT', 'LSK/USDT', 'SC/USDT', 'DGB/USDT', 'XVG/USDT',
-    'FLOKI/USDT', 'BGB/USDT', 'ASTR/USDT', 'OSMO/USDT', 'JASMY/USDT', 'BTT/USDT', 'LUNC/USDT', 'USTC/USDT', 'GMT/USDT', 'GALA/USDT',
-    'TFUEL/USDT', 'STG/USDT', 'JOE/USDT', 'MASK/USDT', 'ID/USDT', 'LINA/USDT', 'WOO/USDT', 'CFX/USDT', 'HOOK/USDT', 'STPT/USDT',
-    'NMR/USDT', 'HIVE/USDT', 'STMX/USDT', 'RIF/USDT', 'CKB/USDT', 'RLC/USDT', 'UMA/USDT', 'BICO/USDT', 'GLMR/USDT', 'MOVR/USDT',
-    'EVMOS/USDT', 'METIS/USDT', 'CANTO/USDT', 'SXP/USDT', 'ZRX/USDT', 'BAL/USDT', 'BAND/USDT', 'API3/USDT', 'TRB/USDT', 'STORJ/USDT',
-    'BLUR/USDT', 'LQTY/USDT', 'RDNT/USDT', 'VELO/USDT', 'RSR/USDT', 'ACH/USDT', 'AUDIO/USDT', 'SKL/USDT', 'CHR/USDT', 'DENT/USDT',
-    'REEF/USDT', 'CTSI/USDT', 'KNC/USDT', 'REN/USDT', 'CVC/USDT', 'IOTX/USDT', 'ALPHA/USDT', 'ALICE/USDT', 'BAKE/USDT', 'BEL/USDT',
-    'MBOX/USDT', 'DAR/USDT', 'KEY/USDT', 'ATA/USDT', 'PROS/USDT', 'MTL/USDT', 'NKN/USDT', 'OGN/USDT', 'PUNDIX/USDT', 'WIN/USDT',
-    'TLM/USDT', 'VOXEL/USDT', 'FORTH/USDT', 'OXT/USDT', 'LOOM/USDT', 'PERP/USDT', 'OOS/USDT', 'RARE/USDT', 'SUPER/USDT', 'POLS/USDT',
-    'FRONT/USDT', 'LTO/USDT', 'DUSK/USDT', 'CEL/USDT', 'STORM/USDT', 'MDT/USDT', 'COTI/USDT', 'DATA/USDT', 'SYS/USDT', 'TOMO/USDT',
-    'WRX/USDT', 'WAN/USDT', 'FUN/USDT', 'QNT/USDT', 'SNT/USDT', 'UTK/USDT', 'PROM/USDT', 'STRAX/USDT', 'STEEM/USDT', 'VTHO/USDT'
-];
+let activeUrls = [];
 
-const saveResults = async (data, file = DATA_FILE) => {
-    await fs.writeJson(file, data);
-};
-
-const loadResults = async (file = DATA_FILE) => {
-    if (await fs.pathExists(file)) {
-        return await fs.readJson(file);
+// التحقق من صحة RPCs
+async function validateUrls() {
+  console.log("🔄 جاري التحقق من صحة RPCs...");
+  const uniqueUrls = [...new Set(ALCHEMY_URLS)]; // إزالة التكرار من القائمة الأساسية
+  const checks = uniqueUrls.map(async (url) => {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getHealth" }),
+        timeout: 5000
+      });
+      const data = await response.json();
+      if (response.ok && data.result === "ok") {
+        console.log(`✅ RPC صالح`);
+        return url;
+      }
+      return null;
+    } catch (e) {
+      console.log(`❌ RPC غير صالح`);
+      return null;
     }
-    return [];
-};
+  });
 
-const saveSettings = async (settings, file = SETTINGS_FILE) => {
-    await fs.writeJson(file, settings);
-};
+  activeUrls = (await Promise.all(checks)).filter(u => u !== null);
 
-const loadSettings = async (file = SETTINGS_FILE) => {
-    if (await fs.pathExists(file)) {
-        return await fs.readJson(file);
-    }
-    if (file === RSI_SETTINGS_FILE) return { intervals: ['1d'], type: '30/70' };
-    return { intervals: ['1d'], type: 'histogram' };
-};
+  if (activeUrls.length === 0) {
+    activeUrls = [ALCHEMY_URLS[0]];
+  }
 
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
+  // محاكاة تعدد الروابط إذا كان الرابط نفسه مكرراً لضمان التوازي البرمجي
+  if (activeUrls.length === 1 && ALCHEMY_URLS.length > 1) {
+     activeUrls = [activeUrls[0], activeUrls[0], activeUrls[0]];
+  }
 
-app.get('/settings', async (req, res) => {
-    const settings = await loadSettings();
-    res.json(settings);
-});
-
-app.post('/save-settings', async (req, res) => {
-    await saveSettings(req.body);
-    res.json({ success: true });
-});
-
-app.get('/rsi-settings', async (req, res) => {
-    const settings = await loadSettings(RSI_SETTINGS_FILE);
-    res.json(settings);
-});
-
-app.post('/save-rsi-settings', async (req, res) => {
-    await saveSettings(req.body, RSI_SETTINGS_FILE);
-    res.json({ success: true });
-});
-
-app.get('/last-results', async (req, res) => {
-    const data = await loadResults();
-    res.json(data);
-});
-
-app.get('/rsi-last-results', async (req, res) => {
-    const data = await loadResults(RSI_DATA_FILE);
-    res.json(data);
-});
-
-function formatTicker(ticker) {
-    const symbol = ticker.symbol.replace('/', '');
-    return { 
-        symbol: symbol.endsWith('USDT') ? symbol.slice(0, -4) : symbol,
-        id: ticker.symbol,
-        currentPrice: ticker.last
-    };
+  console.log(`✅ ${activeUrls.length} قنوات RPC نشطة`);
 }
 
-app.get('/analyze-rsi', async (req, res) => {
-    console.log('RSI analysis started', { query: req.query });
-    const settings = await loadSettings(RSI_SETTINGS_FILE);
-    const intervals = (req.query.intervals || settings.intervals.join(',')).split(',');
-    const rsiType = req.query.type || settings.type;
-    const [lowerBound, upperBound] = rsiType.split('/').map(Number);
-    console.log('RSI analysis settings loaded', { intervals, rsiType, lowerBound, upperBound });
+function getConnection(index = 0) {
+  // استخدام الرابط المقابل للاندكس لضمان التوازي الحقيقي
+  const url = activeUrls[index % activeUrls.length];
+  return new Connection(url, { commitment: "confirmed", disableRetryOnRateLimit: true });
+}
 
-    try {
-        console.log('Fetching tickers from Binance...');
-        const tickers = await fetchWithRestrictedFallbacks(binance, 'fetchTickers');
-        const usdtTickers = Object.values(tickers).filter(t => t.symbol && t.symbol.endsWith('/USDT'));
-        console.log(`Found ${usdtTickers.length} USDT tickers`);
-        const symbols = usdtTickers
-            .sort((a, b) => (b.quoteVolume || 0) - (a.quoteVolume || 0))
-            .slice(0, 50) 
-            .map(formatTicker);
-        console.log(`Selected ${symbols.length} symbols for analysis`);
+const PUMP_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const PUMP_CASHBACK_PROGRAM_ID = new PublicKey("pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA");
+const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 
-        const resultsMap = new Map();
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
 
-        const analyzeSymbolRSI = async (coinData, interval) => {
-            const { symbol } = coinData;
-            const ccxtSymbol = `${symbol}USDT`;
-            try {
-                const ohlcv = await getOHLCV(ccxtSymbol, interval);
-                if (!ohlcv || !Array.isArray(ohlcv)) {
-                    console.log(`No OHLCV data for ${ccxtSymbol} on ${interval}`);
-                    return null;
-                }
-                if (ohlcv.length < 30) {
-                    console.log(`Not enough data for ${ccxtSymbol} on ${interval} (length: ${ohlcv.length})`);
-                    return null;
-                }
-
-                const lows = ohlcv.map(d => d[3]);
-                const closes = ohlcv.map(d => d[4]);
-
-                const rsiValues = RSI.calculate({ values: closes, period: 14 });
-                if (rsiValues.length < 15) return null;
-
-                const offset = closes.length - rsiValues.length;
-                const troughs = [];
-                const w = (interval === '1h') ? 5 : (interval === '4h' ? 6 : (interval === '1d' ? 4 : 2));
-
-                for (let i = w; i < rsiValues.length - w; i++) {
-                    if (rsiValues[i] <= rsiValues[i - 1] && rsiValues[i] <= rsiValues[i + 1]) {
-                        if (rsiValues[i] < rsiValues[i - 1] || rsiValues[i] < rsiValues[i + 1]) {
-                            let isLocalMin = true;
-                            for (let j = 1; j <= w; j++) {
-                                if (rsiValues[i] > rsiValues[i - j] || rsiValues[i] > rsiValues[i + j]) {
-                                    isLocalMin = false; break;
-                                }
-                            }
-                            if (isLocalMin) troughs.push(i);
-                        }
-                    }
-                }
-
-                if (troughs.length >= 2) {
-                    const lastTroughIdx = troughs[troughs.length - 1];
-                    const prevTroughIdx = troughs[troughs.length - 2];
-                    const distance = lastTroughIdx - prevTroughIdx;
-
-                    if (distance >= 5 && distance <= 80) {
-                        const valAtLast = rsiValues[lastTroughIdx];
-                        const valAtPrev = rsiValues[prevTroughIdx];
-                        const priceAtLast = lows[lastTroughIdx + offset];
-                        const priceAtPrev = lows[prevTroughIdx + offset];
-
-                        if (priceAtLast <= priceAtPrev && valAtLast > valAtPrev && valAtLast <= (lowerBound + 5)) {
-                            const priceDiffPct = priceAtPrev > 0 ? ((priceAtPrev - priceAtLast) / priceAtPrev) * 100 : 0;
-                            const indicatorImprovementPct = ((valAtLast - valAtPrev) / valAtPrev) * 100;
-
-                            let strength = 70 + (Math.min(15, priceDiffPct * 2) + Math.min(15, indicatorImprovementPct / 2));
-
-                            return {
-                                symbol,
-                                currentPrice: closes[closes.length - 1],
-                                strength: Math.min(100, strength),
-                                interval,
-                                isMatch: true
-                            };
-                        }
-                    }
-                }
-
-                const lastRsi = rsiValues[rsiValues.length - 1];
-                let baseStrength = 0;
-                if (lastRsi < lowerBound) baseStrength = 40 + (lowerBound - lastRsi) * 2;
-                else if (lastRsi < (lowerBound + 10)) baseStrength = 20 + (lowerBound + 10 - lastRsi);
-
-                return {
-                    symbol,
-                    currentPrice: closes[closes.length - 1],
-                    strength: Math.min(69, baseStrength),
-                    interval,
-                    isMatch: false
-                };
-            } catch (e) { return null; }
-        };
-
-        const allAnalyzedResults = [];
-        const chunkSize = 20; // Binance has high limits, but let's be reasonable
-        for (let i = 0; i < symbols.length; i += chunkSize) {
-            const chunk = symbols.slice(i, i + chunkSize);
-            const chunkTasks = [];
-            for (const interval of intervals) {
-                for (const symbolData of chunk) {
-                    chunkTasks.push(limit(() => analyzeSymbolRSI(symbolData, interval)));
-                }
-            }
-            const results = await Promise.all(chunkTasks);
-            allAnalyzedResults.push(...results.filter(r => r !== null));
-        }
-
-        symbols.forEach(s => {
-            resultsMap.set(s.symbol, {
-                symbol: s.symbol,
-                currentPrice: s.currentPrice,
-                strength: 0,
-                intervals: [],
-                matches: []
-            });
-        });
-
-        allAnalyzedResults.filter(r => r !== null).forEach(r => {
-            const existing = resultsMap.get(r.symbol);
-            if (existing) {
-                existing.intervals.push(r.interval);
-                if (r.isMatch) {
-                    existing.matches.push(r.interval);
-                    existing.strength = Math.max(existing.strength, r.strength + (existing.matches.length > 1 ? 10 : 0));
-                } else {
-                    existing.strength = Math.max(existing.strength, r.strength);
-                }
-            }
-        });
-
-        const finalResults = Array.from(resultsMap.values())
-            .sort((a, b) => {
-                if (b.matches.length !== a.matches.length) return b.matches.length - a.matches.length;
-                return b.strength - a.strength;
-            });
-        console.log(`RSI analysis complete. Found ${finalResults.length} results.`);
-        await saveResults(finalResults, RSI_DATA_FILE);
-        res.json(finalResults);
-    } catch (e) { 
-        console.error('RSI analysis error:', e);
-        res.status(500).json({ error: e.message }); 
-    }
+// معالجة خطأ التكرار لإيقاف النسخ القديمة
+bot.on('polling_error', (error) => {
+  if (error.code === 'ETELEGRAM' && error.message.includes('409 Conflict')) {
+    console.log("⚠️ تم اكتشاف نسخة أخرى تعمل، جاري محاولة التوقف...");
+    process.exit(1); // الخروج للسماح لـ Replit بإعادة التشغيل النظيف
+  }
 });
 
-app.get('/analyze', async (req, res) => {
-    console.log('MACD analysis started', { query: req.query });
-    const settings = await loadSettings();
-    const intervals = (req.query.intervals || settings.intervals.join(',')).split(',');
-    const analysisType = req.query.type || settings.type;
-    console.log('MACD analysis settings loaded', { intervals, analysisType });
+const userRequests = new Map();
 
-    try {
-        console.log('Fetching tickers from Binance...');
-        const tickers = await fetchWithRestrictedFallbacks(binance, 'fetchTickers');
-        const usdtTickers = Object.values(tickers).filter(t => t.symbol && t.symbol.endsWith('/USDT'));
-        console.log(`Found ${usdtTickers.length} USDT tickers`);
-        const symbols = usdtTickers
-            .sort((a, b) => (b.quoteVolume || 0) - (a.quoteVolume || 0))
-            .slice(0, 50) 
-            .map(formatTicker);
-        console.log(`Selected ${symbols.length} symbols for analysis`);
+// دالة لحساب PDA المكافآت العادية
+function getCreatorVaultPDA(creator) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("creator-vault"), creator.toBuffer()],
+    PUMP_PROGRAM_ID
+  );
+  return pda;
+}
 
-        const resultsMap = new Map();
+// دالة لحساب PDA الكاش باك الجديد
+function getPumpCashbackPDA(userWallet) {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from("user_volume_accumulator"), userWallet.toBuffer()],
+    PUMP_CASHBACK_PROGRAM_ID
+  );
+  return pda;
+}
 
-        const analyzeSymbol = async (coinData, interval) => {
-            const { symbol } = coinData;
-            const ccxtSymbol = `${symbol}USDT`;
-            try {
-                const ohlcv = await getOHLCV(ccxtSymbol, interval);
-                if (!ohlcv || !Array.isArray(ohlcv)) {
-                    console.log(`No OHLCV data for ${ccxtSymbol} on ${interval}`);
-                    return null;
-                }
-                if (ohlcv.length < 30) {
-                    console.log(`Not enough data for ${ccxtSymbol} on ${interval} (length: ${ohlcv.length})`);
-                    return null;
-                }
+// دالة محسنة للحصول على الرصيد
+async function getAccountBalance(conn, pubkey) {
+  try {
+    const info = await conn.getAccountInfo(pubkey);
+    if (!info) return 0;
+    return info.lamports / 1e9;
+  } catch (e) {
+    return 0;
+  }
+}
 
-                const lows = ohlcv.map(d => d[3]);
-                const closes = ohlcv.map(d => d[4]);
-
-                const macdInput = {
-                    values: closes,
-                    fastPeriod: 12,
-                    slowPeriod: 26,
-                    signalPeriod: 9,
-                    SimpleMAOscillator: false,
-                    SimpleMASignal: false
-                };
-
-                const macdResults = MACD.calculate(macdInput);
-                if (macdResults.length < 20) return null;
-
-                const targetData = (analysisType === 'histogram') 
-                    ? macdResults.map(m => m.histogram) 
-                    : macdResults.map(m => m.MACD);
-
-                const macdLines = macdResults.map(m => m.MACD);
-                const offset = closes.length - targetData.length;
-
-                if (analysisType === 'histogram') {
-                    // 1) Find Price Lows (Troughs)
-                    const priceTroughs = [];
-                    const pw = 4; // Window for price trough
-                    for (let i = pw; i < lows.length - pw; i++) {
-                        if (lows[i] <= lows[i - 1] && lows[i] <= lows[i + 1]) {
-                            let isLocal = true;
-                            for (let j = 1; j <= pw; j++) {
-                                if (lows[i] > lows[i - j] || lows[i] > lows[i + j]) { isLocal = false; break; }
-                            }
-                            if (isLocal) priceTroughs.push(i);
-                        }
-                    }
-
-                    if (priceTroughs.length >= 2) {
-                        // Look for divergence between last two price troughs
-                        for (let t = priceTroughs.length - 1; t >= 1; t--) {
-                            const lastPriceIdx = priceTroughs[t];
-                            const prevPriceIdx = priceTroughs[t - 1];
-                            const distance = lastPriceIdx - prevPriceIdx;
-
-                            if (distance < 5 || distance > 60) continue;
-
-                            const offset = closes.length - targetData.length;
-                            const mappedPrev = prevPriceIdx - offset;
-                            const mappedLast = lastPriceIdx - offset;
-
-                            if (mappedPrev >= 0 && mappedLast < targetData.length) {
-                                const hPrevVal = targetData[mappedPrev];
-                                const hLastVal = targetData[mappedLast];
-
-                                const pricePrev = lows[prevPriceIdx];
-                                const priceLast = lows[lastPriceIdx];
-                                
-                                if (priceLast < pricePrev && hLastVal > hPrevVal && hPrevVal < 0) {
-                                    // Filter: Wave Clarity (Ensure no massive green spikes between troughs)
-                                    const sliceBetween = targetData.slice(mappedPrev + 1, mappedLast);
-                                    if (sliceBetween.length > 0) {
-                                        const maxGreen = Math.max(...sliceBetween);
-                                        if (maxGreen > Math.abs(hPrevVal) * 0.5) continue;
-                                    }
-
-                                    const currentHist = targetData[targetData.length - 1];
-                                    const prevHist = targetData[targetData.length - 2];
-                                    
-                                    if (currentHist > prevHist) {
-                                        const priceDiff = ((pricePrev - priceLast) / pricePrev) * 100;
-                                        const convDiff = (hLastVal - hPrevVal);
-                                        let strength = 80 + (priceDiff * 2) + (Math.min(20, convDiff * 500));
-
-                                        return {
-                                            symbol,
-                                            currentPrice: closes[closes.length - 1],
-                                            strength: Math.min(100, strength),
-                                            interval,
-                                            isMatch: true
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    const macdTroughs = [];
-                    const w = (interval === '1h') ? 5 : (interval === '4h' ? 6 : (interval === '1d' ? 4 : 2));
-
-                    for (let i = w; i < targetData.length - w; i++) {
-                        if (targetData[i] <= targetData[i - 1] && targetData[i] <= targetData[i + 1]) {
-                            let isLocalMin = true;
-                            for (let j = 1; j <= w; j++) {
-                                if (targetData[i] > targetData[i - j] || targetData[i] > targetData[i + j]) {
-                                    isLocalMin = false; break;
-                                }
-                            }
-                            if (isLocalMin) macdTroughs.push(i);
-                        }
-                    }
-
-                    if (macdTroughs.length >= 2) {
-                        for (let t = macdTroughs.length - 1; t >= 1; t--) {
-                            const lastTroughIdx = macdTroughs[t];
-                            const prevTroughIdx = macdTroughs[t - 1];
-                            const distance = lastTroughIdx - prevTroughIdx;
-
-                            if (distance < 5 || distance > 80) continue;
-
-                            const valAtLast = targetData[lastTroughIdx];
-                            const valAtPrev = targetData[prevTroughIdx];
-                            const priceAtLast = lows[lastTroughIdx + offset];
-                            const priceAtPrev = lows[prevTroughIdx + offset];
-
-                            if (priceAtLast < priceAtPrev && valAtLast > valAtPrev && valAtLast < 0) {
-                                const priceDiffPct = ((priceAtPrev - priceAtLast) / priceAtPrev) * 100;
-                                let strength = 70 + (priceDiffPct * 2);
-
-                                return {
-                                    symbol,
-                                    currentPrice: closes[closes.length - 1],
-                                    strength: Math.min(100, strength),
-                                    interval,
-                                    isMatch: true
-                                };
-                            }
-                        }
-                    }
-                }
-
-                const lastHist = targetData[targetData.length - 1];
-                const prevHist = targetData[targetData.length - 2];
-                let baseStrength = 0;
-                if (lastHist > prevHist && lastHist < 0) {
-                    baseStrength = 40 + (Math.min(30, (lastHist - prevHist) / Math.abs(prevHist) * 100));
-                }
-
-                return {
-                    symbol,
-                    currentPrice: closes[closes.length - 1],
-                    strength: Math.min(69, baseStrength),
-                    interval,
-                    isMatch: false
-                };
-            } catch (e) { 
-                console.log(`Error analyzing ${symbol} on ${interval}:`, e.message);
-                return null;
-            }
-        };
-
-        const allAnalyzedResults = [];
-        const chunkSize = 20;
-        for (let i = 0; i < symbols.length; i += chunkSize) {
-            const chunk = symbols.slice(i, i + chunkSize);
-            const chunkTasks = [];
-            for (const interval of intervals) {
-                for (const symbolData of chunk) {
-                    chunkTasks.push(limit(() => analyzeSymbol(symbolData, interval)));
-                }
-            }
-            const results = await Promise.all(chunkTasks);
-            allAnalyzedResults.push(...results.filter(r => r !== null));
-        }
-
-        symbols.forEach(s => {
-            resultsMap.set(s.symbol, {
-                symbol: s.symbol,
-                currentPrice: s.currentPrice,
-                strength: 0,
-                intervals: [],
-                matches: []
-            });
-        });
-
-        allAnalyzedResults.filter(r => r !== null).forEach(r => {
-            const existing = resultsMap.get(r.symbol);
-            if (existing) {
-                existing.intervals.push(r.interval);
-                if (r.isMatch) {
-                    existing.matches.push(r.interval);
-                    existing.strength = Math.max(existing.strength, r.strength + (existing.matches.length > 1 ? 10 : 0));
-                } else {
-                    existing.strength = Math.max(existing.strength, r.strength);
-                }
-            }
-        });
-
-        const finalResults = Array.from(resultsMap.values())
-            .sort((a, b) => {
-                if (b.matches.length !== a.matches.length) {
-                    return b.matches.length - a.matches.length;
-                }
-                return b.strength - a.strength;
-            });
-        console.log(`MACD analysis complete. Found ${finalResults.length} results.`);
-        await saveResults(finalResults, DATA_FILE);
-        res.json(finalResults);
-    } catch (e) { 
-        console.error('MACD analysis error:', e);
-        res.status(500).json({ error: e.message }); 
+// دالة للحصول على رصيد WSOL لمحفظة معينة
+async function getWSOLBalance(conn, owner) {
+  try {
+    const response = await conn.getTokenAccountsByOwner(owner, {
+      mint: WSOL_MINT,
+    });
+    
+    if (response.value.length === 0) return 0;
+    
+    let totalBalance = 0;
+    for (const account of response.value) {
+      const balance = await conn.getTokenAccountBalance(account.pubkey);
+      totalBalance += parseFloat(balance.value.uiAmount || 0);
     }
-});
+    return totalBalance;
+  } catch (e) {
+    return 0;
+  }
+}
 
-// Optimized arbitrage logic directly in index.js
-const ARB_EXCHANGES = [
-    'binance', 'bybit', 'okx', 'kucoin', 'gateio', 
-    'mexc', 'bitget', 'kraken', 'bitfinex', 'coinbase',
-    'poloniex', 'hitbtc', 'coinex', 'ascendex', 'phemex', 
-    'toobit', 'deepcoin', 'htx', 'huobi', 'whitebit', 'xt'
-];
+// دالة متقدمة لاستخراج المحافظ من أي نص أو ملف
+function extractWalletsFromText(text) {
+  // إذا كان النص طويلاً جداً، فهذا يعني أنه ملف
+  if (text.length > 4000) {
+    console.log("📄 تم استلام ملف كبير، جاري معالجته...");
+  }
 
-const arbExchangeInstances = {};
-function getArbExchange(id) {
-    if (!arbExchangeInstances[id]) {
+  const lines = text.split('\n');
+  const wallets = new Map();
+
+  lines.forEach(line => {
+    const trimmedLine = line.trim();
+    if (!trimmedLine) return;
+
+    // Base58 private key
+    try {
+      const decoded = bs58.decode(trimmedLine);
+      if (decoded.length === 64) {
+        const keypair = Keypair.fromSecretKey(decoded);
+        const address = keypair.publicKey.toBase58();
+        if (!wallets.has(address)) {
+          wallets.set(address, {
+            address: address,
+            privateKey: trimmedLine,
+            type: 'privateKey'
+          });
+        }
+        return;
+      }
+    } catch (e) {}
+
+    // Array format [123,45,67,...]
+    if (trimmedLine.startsWith('[') && trimmedLine.endsWith(']')) {
+      try {
+        const numbers = JSON.parse(trimmedLine);
+        if (Array.isArray(numbers) && numbers.length === 64) {
+          const secretKey = Uint8Array.from(numbers);
+          const keypair = Keypair.fromSecretKey(secretKey);
+          const address = keypair.publicKey.toBase58();
+          if (!wallets.has(address)) {
+            wallets.set(address, {
+              address: address,
+              privateKey: trimmedLine,
+              type: 'privateKey'
+            });
+          }
+          return;
+        }
+      } catch (e) {}
+    }
+
+    // Solana address
+    const solanaAddressRegex = /[1-9A-HJ-NP-Za-km-z]{32,44}/g;
+    const addresses = trimmedLine.match(solanaAddressRegex);
+
+    if (addresses) {
+      addresses.forEach(address => {
         try {
-            arbExchangeInstances[id] = new ccxt[id]({ enableRateLimit: true, timeout: 10000 });
-        } catch (e) { return null; }
+          new PublicKey(address);
+          if (!wallets.has(address)) {
+            wallets.set(address, {
+              address: address,
+              privateKey: null,
+              type: 'address'
+            });
+          }
+        } catch (e) {}
+      });
     }
-    return arbExchangeInstances[id];
+  });
+
+  return Array.from(wallets.values());
 }
 
-app.get('/api/arbitrage-last-results', async (req, res) => {
-    const data = await loadResults(ARB_DATA_FILE);
-    res.json(data);
-});
+// فحص محفظة واحدة
+async function checkWallet(walletData, rpcIndex = 0) {
+  const { address, privateKey, type } = walletData;
 
-app.get('/api/arbitrage', async (req, res) => {
-    console.log('Arbitrage analysis started');
-    try {
-        const fetchTasks = ARB_EXCHANGES.map(id => (async () => {
-            const ex = getArbExchange(id);
-            if (!ex) {
-                console.log(`Exchange ${id} not initialized`);
-                return [];
-            }
-            try {
-                const tickers = await fetchWithRestrictedFallbacks(ex, 'fetchTickers');
-                const filtered = Object.values(tickers)
-                    .filter(t => t.symbol && t.symbol.endsWith('/USDT') && t.bid > 0 && t.ask > 0)
-                    .map(t => ({ 
-                        exchange: id.toUpperCase(), 
-                        symbol: t.symbol, 
-                        bid: t.bid, 
-                        ask: t.ask, 
-                        bidVolume: t.bidVolume, 
-                        askVolume: t.askVolume  
-                    }));
-                console.log(`Fetched ${filtered.length} tickers from ${id}`);
-                return filtered;
-            } catch (e) { 
-                console.log(`Error fetching tickers from ${id}:`, e.message);
-                return []; 
-            }
-        })());
+  try {
+    const creatorWallet = new PublicKey(address);
+    const pumpPDA = getCreatorVaultPDA(creatorWallet);
+    const cashbackPDA = getPumpCashbackPDA(creatorWallet);
 
-        const allResults = await Promise.all(fetchTasks);
-        const allTickers = allResults.flat();
-        console.log(`Total tickers collected: ${allTickers.length}`);
-                const groups = {};
-                allTickers.forEach(t => {
-                    if (!groups[t.symbol]) groups[t.symbol] = [];
-                    groups[t.symbol].push(t);
-                });
+    // استخدام RPC محدد بناءً على ترتيب المحفظة في الدفعة
+    const connection = getConnection(rpcIndex);
+    
+    // إضافة timeout للطلب لتجنب التعليق وتقليل وقت الانتظار
+    const [pumpBalance, cashbackBalance] = await Promise.all([
+      Promise.race([
+        getAccountBalance(connection, pumpPDA),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
+      ]),
+      Promise.race([
+        getWSOLBalance(connection, cashbackPDA),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 10000))
+      ])
+    ]);
 
-                const opportunities = [];
-                for (const [symbol, tickers] of Object.entries(groups)) {
-                    if (tickers.length < 2) continue;
-                    
-                    // We want to BUY at the lowest ASK and SELL at the highest BID
-                    let minAskT = tickers[0], maxBidT = tickers[0];
-                    tickers.forEach(t => {
-                        if (t.ask < minAskT.ask) minAskT = t;
-                        if (t.bid > maxBidT.bid) maxBidT = t;
-                    });
+    return {
+      address: address,
+      privateKey: privateKey,
+      hasPrivateKey: type === 'privateKey',
+      pumpPDA: pumpPDA.toBase58(),
+      cashbackPDA: cashbackPDA.toBase58(),
+      pumpBalance: pumpBalance,
+      cashbackBalance: cashbackBalance,
+      success: true,
+      error: null
+    };
+  } catch (error) {
+    return {
+      address: address,
+      privateKey: privateKey,
+      hasPrivateKey: type === 'privateKey',
+      pumpPDA: 'غير متاح',
+      cashbackPDA: 'غير متاح',
+      pumpBalance: 0,
+      cashbackBalance: 0,
+      success: false,
+      error: error.message
+    };
+  }
+}
 
-                    // REAL Spread = (Best Bid Price - Best Ask Price) / Best Ask Price
-                    const diff = ((maxBidT.bid - minAskT.ask) / minAskT.ask * 100);
-                    
-                    if (diff >= 0.1 && diff < 5 && minAskT.ask > 0.000001) {
-                        opportunities.push({
-                            symbol, 
-                            maxDiff: diff.toFixed(2),
-                            liquidityScore: Math.min(minAskT.askVolume || 0, maxBidT.bidVolume || 0),
-                            prices: tickers.map(t => ({
-                                exchange: t.exchange, 
-                                price: t.bid, 
-                                bid: t.bid,
-                                ask: t.ask,
-                                bidVolume: t.bidVolume,
-                                askVolume: t.askVolume,
-                                diff: ((t.bid - minAskT.ask) / minAskT.ask * 100).toFixed(2),
-                                isMin: t.ask === minAskT.ask, 
-                                isMax: t.bid === maxBidT.bid  
-                            })).sort((a, b) => a.bid - b.bid)
-                        });
-                    }
-                }
-        const finalArbResults = { 
-            timestamp: new Date().toISOString(),
-            opportunities: opportunities.sort((a, b) => b.maxDiff - a.maxDiff) 
-        };
-        console.log(`Arbitrage analysis complete. Found ${opportunities.length} opportunities.`);
-        await saveResults(finalArbResults, ARB_DATA_FILE);
-        res.json(finalArbResults);
-    } catch (e) { 
-        console.error('Arbitrage analysis error:', e);
-        res.status(500).json({ error: e.message }); 
+// فحص متوازي للمحافظ - كل 3 محافظ معاً
+async function checkWalletsParallel(wallets, onProgress) {
+  const results = [];
+  const batchSize = 3; // نرسل 3 طلبات معاً لأن عندنا 3 RPCs
+
+  for (let i = 0; i < wallets.length; i += batchSize) {
+    const batch = wallets.slice(i, i + batchSize);
+    const batchPromises = batch.map((wallet, index) => checkWallet(wallet, index));
+
+    // تنفيذ 3 محافظ بالتوازي
+    const batchResults = await Promise.all(batchPromises);
+    results.push(...batchResults);
+
+    // تحديث التقدم
+    if (onProgress) {
+      onProgress(Math.min(i + batchSize, wallets.length), wallets.length);
     }
+
+    // تأخير قليل بين الدفعات
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+
+  return results;
+}
+
+// إنشاء ملف النتائج
+function createResultsFile(results) {
+  const sortedResults = [...results].sort((a, b) => (b.pumpBalance + b.cashbackBalance) - (a.pumpBalance + a.cashbackBalance));
+  const resultsWithBalance = sortedResults.filter(r => r.success && (r.pumpBalance > 0 || r.cashbackBalance > 0));
+
+  let content = '';
+  let totalPump = 0;
+  let totalCashback = 0;
+
+  resultsWithBalance.forEach((result, index) => {
+    totalPump += result.pumpBalance;
+    totalCashback += result.cashbackBalance;
+
+    content += `═══════════════════════════════════════════\n`;
+    content += `المحفظة #${index + 1}\n`;
+    content += `═══════════════════════════════════════════\n`;
+    content += `📍 العنوان: ${result.address}\n`;
+
+    if (result.hasPrivateKey) {
+      content += `🔑 المفتاح الخاص: ${result.privateKey}\n`;
+    }
+
+    content += `🏦 PDA المكافآت: ${result.pumpPDA}\n`;
+    content += `💰 رصيد المكافآت: ${result.pumpBalance.toFixed(6)} SOL\n`;
+    content += `💸 رصيد الكاش باك: ${result.cashbackBalance.toFixed(6)} SOL\n`;
+    content += `🔗 Solscan: https://solscan.io/account/${result.address}\n`;
+    content += `═══════════════════════════════════════════\n\n`;
+  });
+
+  // إحصائيات
+  content += `\n═══════════════════════════════════════════\n`;
+  content += `📊 إحصائيات عامة\n`;
+  content += `═══════════════════════════════════════════\n`;
+  content += `✅ المحافظ التي بها رصيد: ${resultsWithBalance.length}\n`;
+  content += `💰 إجمالي المكافآت: ${totalPump.toFixed(6)} SOL\n`;
+  content += `💸 إجمالي الكاش باك: ${totalCashback.toFixed(6)} SOL\n`;
+  content += `🔥 الإجمالي الكلي: ${(totalPump + totalCashback).toFixed(6)} SOL\n`;
+  content += `⏰ وقت الفحص: ${new Date().toLocaleString('ar-EG')}\n`;
+
+  return content;
+}
+
+// دالة لتنسيق النتيجة كرسالة نصية قصيرة
+function formatResultsAsMessage(results) {
+  const sortedResults = [...results].sort((a, b) => (b.pumpBalance + b.cashbackBalance) - (a.pumpBalance + a.cashbackBalance));
+  const resultsWithBalance = sortedResults.filter(r => r.success && (r.pumpBalance > 0 || r.cashbackBalance > 0));
+  
+  if (resultsWithBalance.length === 0) return "❌ لم يتم العثور على أي رصيد.";
+
+  let message = `📊 *نتائج الفحص (${resultsWithBalance.length} محفظة)*\n\n`;
+  let total = 0;
+
+  resultsWithBalance.slice(0, 15).forEach((r, i) => {
+    const sum = r.pumpBalance + r.cashbackBalance;
+    total += sum;
+    message += `*${i+1}.* \`${r.address.substring(0,6)}...${r.address.substring(r.address.length-4)}\`\n`;
+    message += `💰 Pump: \`${r.pumpBalance.toFixed(4)}\` | 💸 Cash: \`${r.cashbackBalance.toFixed(4)}\`\n\n`;
+  });
+
+  if (resultsWithBalance.length > 15) {
+    message += `... و ${resultsWithBalance.length - 15} محافظ أخرى (موجودة في الملف المرفق)\n\n`;
+  }
+
+  const grandTotal = resultsWithBalance.reduce((s, r) => s + r.pumpBalance + r.cashbackBalance, 0);
+  message += `*🔥 الإجمالي الكلي: ${grandTotal.toFixed(6)} SOL*`;
+  
+  return message;
+}
+
+  // معالجة رسائل التلغرام
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+
+  // التحقق إذا كان هناك ملف مرفق
+  if (msg.document) {
+    try {
+      const fileId = msg.document.file_id;
+      const fileLink = await bot.getFileLink(fileId);
+      const response = await fetch(fileLink);
+      const fileContent = await response.text();
+
+      if (!fileContent || fileContent.trim().length === 0) {
+        return bot.sendMessage(chatId, "❌ الملف فارغ");
+      }
+
+      // معالجة محتوى الملف وتعيينه كـ text لمعالجته لاحقاً
+      msg.text = fileContent;
+      console.log(`📄 تم استلام ملف بحجم ${fileContent.length} حرف`);
+    } catch (error) {
+      console.error("Error reading file:", error);
+      return bot.sendMessage(chatId, "❌ فشل في قراءة الملف. تأكد أنه ملف نصي صالح.");
+    }
+  }
+
+  const text = msg.text;
+  if (!text) return;
+
+  if (msg.text === '/start' || msg.text === '/help') {
+    // إنهاء أي عمليات جارية للمستخدم عند طلب البدء من جديد
+    if (userRequests.has(chatId)) {
+      userRequests.delete(chatId);
+      bot.sendMessage(chatId, "🔄 تم إعادة ضبط الجلسة وإيقاف العمليات السابقة.");
+    }
+
+    return bot.sendMessage(chatId, 
+      `🎯 *بوت فحص مكافآت Pump.fun*\n\n` +
+      `*المميزات:*\n` +
+      `• فحص متوازي: 3 محافظ في نفس الوقت\n` +
+      `• دعم الملفات النصية (.txt)\n` +
+      `• دعم جميع تنسيقات المفاتيح\n` +
+      `• منع التكرار تلقائياً\n` +
+      `• ترتيب النتائج من الأعلى للأقل\n\n` +
+      `*الاستخدام:*\n` +
+      `• أرسل نصاً به عناوين أو مفاتيح\n` +
+      `• أرسل ملف .txt يحتوي على القائمة\n` +
+      `• حتى 100 محفظة في المرة الواحدة`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  if (msg.text === '/cancel') {
+    userRequests.delete(chatId);
+    return bot.sendMessage(chatId, "✅ تم الإلغاء");
+  }
+
+  if (userRequests.has(chatId)) {
+    return bot.sendMessage(chatId, "⏳ يوجد فحص جاري");
+  }
+
+  userRequests.set(chatId, true);
+
+  let statusMessage = null;
+
+  try {
+    const extractedWallets = extractWalletsFromText(msg.text);
+    const sourceType = msg.document ? 'ملف' : 'نص';
+
+    if (extractedWallets.length === 0) {
+      userRequests.delete(chatId);
+      return bot.sendMessage(chatId, `❌ لم يتم العثور على محافظ صالحة في ال${sourceType}`);
+    }
+
+    if (extractedWallets.length > 2000) {
+      userRequests.delete(chatId);
+      return bot.sendMessage(chatId, "❌ الحد الأقصى 100 محفظة");
+    }
+
+    statusMessage = await bot.sendMessage(
+      chatId, 
+      `📄 تم استخراج ${extractedWallets.length} محفظة من ال${sourceType}\n` +
+      `🔄 جاري الفحص المتوازي (3 محافظ في نفس الوقت)...`
+    );
+
+    const results = [];
+    let processed = 0;
+
+    // فحص متوازي للمحافظ
+    for (let i = 0; i < extractedWallets.length; i += activeUrls.length) {
+      const batch = extractedWallets.slice(i, i + activeUrls.length);
+      // تمرير الاندكس لضمان استخدام RPC مختلف لكل محفظة في الدفعة
+      const batchPromises = batch.map((wallet, index) => checkWallet(wallet, index));
+
+      // تنفيذ المحافظ بالتوازي
+      const batchResults = await Promise.all(batchPromises);
+      results.push(...batchResults);
+
+      processed += batch.length;
+
+      // تحديث كل دفعة
+      await bot.editMessageText(
+        `📊 تم فحص ${processed} من ${extractedWallets.length} محفظة...\n` +
+        `⚡ سرعة: 3 محافظ لكل دفعة`,
+        {
+          chat_id: chatId,
+          message_id: statusMessage.message_id
+        }
+      );
+
+      // تأخير قليل جداً
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    await bot.deleteMessage(chatId, statusMessage.message_id);
+
+    const resultsWithBalance = results.filter(r => r.success && (r.pumpBalance > 0 || r.cashbackBalance > 0));
+
+    if (resultsWithBalance.length === 0) {
+      await bot.sendMessage(chatId, "❌ لم يتم العثور على أي رصيد في جميع المحافظ");
+      return;
+    }
+
+    const message = formatResultsAsMessage(results);
+    await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+
+    // إذا كانت النتائج كثيرة، نرسل ملفاً أيضاً
+    if (resultsWithBalance.length > 5) {
+      const fileContent = createResultsFile(results);
+      const fileName = `pump_combined_results_${Date.now()}.txt`;
+      const filePath = path.join('/tmp', fileName);
+      fs.writeFileSync(filePath, fileContent, 'utf8');
+
+      await bot.sendDocument(chatId, filePath, {
+        caption: `📊 النتائج الكاملة لـ ${results.length} محفظة\n` +
+                 `🔥 الإجمالي الكلي: ${resultsWithBalance.reduce((sum, r) => sum + r.pumpBalance + r.cashbackBalance, 0).toFixed(6)} SOL`
+      });
+
+      fs.unlinkSync(filePath);
+    }
+
+  } catch (error) {
+    if (statusMessage) {
+      try { await bot.deleteMessage(chatId, statusMessage.message_id); } catch (e) {}
+    }
+    await bot.sendMessage(chatId, `❌ خطأ: ${error.message}`);
+  } finally {
+    userRequests.delete(chatId);
+  }
 });
 
-app.listen(port, '0.0.0.0', () => {
-    console.log(`Server running at http://0.0.0.0:${port}`);
+// صفحة ويب
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>بوت فحص Pump.fun</title>
+        <style>
+            body { font-family: Arial; background: #1a1a1a; color: #fff; text-align: center; padding: 50px; }
+            .container { max-width: 600px; margin: 0 auto; background: #2d2d2d; padding: 30px; border-radius: 10px; }
+            h1 { color: #00ff9d; }
+            .status { color: #00ff9d; font-size: 20px; margin: 20px 0; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h1>🎯 بوت فحص Pump.fun</h1>
+            <div class="status">✅ البوت يعمل - ${activeUrls.length} RPC نشطة</div>
+            <p>⚡ فحص متوازي: 3 محافظ في نفس الوقت</p>
+            <p>📁 دعم الملفات النصية</p>
+        </div>
+    </body>
+    </html>
+  `);
+});
+
+// بدء التشغيل
+app.listen(PORT, "0.0.0.0", async () => {
+  await validateUrls();
+  console.log(`🚀 السيرفر على port ${PORT}`);
+  console.log(`🤖 بوت التلغرام يعمل...`);
 });

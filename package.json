@@ -2,20 +2,20 @@
   "name": "nodejs",
   "version": "1.0.0",
   "description": "",
+  "type": "module",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@solana/web3.js": "^1.98.4",
     "@types/node": "^22.13.11",
-    "axios": "^1.13.6",
-    "ccxt": "^4.5.42",
-    "express": "^4.18.2",
-    "fs-extra": "^11.1.0",
-    "technicalindicators": "^3.1.0"
+    "bs58": "^6.0.0",
+    "express": "^5.2.1",
+    "node-fetch": "^2.7.0",
+    "node-telegram-bot-api": "^0.67.0"
   }
 }
